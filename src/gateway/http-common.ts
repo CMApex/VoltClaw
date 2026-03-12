@@ -3,16 +3,21 @@ import type { GatewayAuthResult } from "./auth.js";
 import { readJsonBody } from "./hooks.js";
 
 /**
- * Apply baseline security headers that are safe for all response types (API JSON,
- * HTML pages, static assets, SSE streams). Headers that restrict framing or set a
- * Content-Security-Policy are intentionally omitted here because some handlers
- * (canvas host, A2UI) serve content that may be loaded inside frames.
+ * Apply baseline security headers for all HTTP responses.
+ *
+ * X-Frame-Options defaults to DENY to prevent clickjacking on API/UI routes.
+ * Handlers that intentionally serve framed content (canvas host, A2UI) should
+ * override or remove it after calling this function.
+ *
+ * Content-Security-Policy is intentionally omitted because framing policy
+ * differs per handler; the control UI sets its own strict CSP.
  */
 export function setDefaultSecurityHeaders(
   res: ServerResponse,
   opts?: { strictTransportSecurity?: string },
 ) {
   res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("X-Frame-Options", "DENY");
   res.setHeader("Referrer-Policy", "no-referrer");
   res.setHeader("Permissions-Policy", "camera=(), microphone=(), geolocation=()");
   const strictTransportSecurity = opts?.strictTransportSecurity;
@@ -70,11 +75,35 @@ export function sendInvalidRequest(res: ServerResponse, message: string) {
   });
 }
 
+/**
+ * Returns true if the request Content-Type is acceptable for JSON endpoints.
+ * Accepts `application/json` (with optional charset/boundary params) and
+ * missing Content-Type (for backwards compat with curl/scripts that omit it).
+ */
+function isJsonContentType(req: IncomingMessage): boolean {
+  const ct = req.headers["content-type"];
+  if (!ct) {
+    return true; // allow missing for CLI/script compat
+  }
+  // Extract media type before any parameters (charset, boundary, etc.)
+  const mediaType = ct.split(";")[0]?.trim().toLowerCase();
+  return mediaType === "application/json";
+}
+
 export async function readJsonBodyOrError(
   req: IncomingMessage,
   res: ServerResponse,
   maxBytes: number,
 ): Promise<unknown> {
+  if (!isJsonContentType(req)) {
+    sendJson(res, 415, {
+      error: {
+        message: "Unsupported Media Type. Expected application/json.",
+        type: "invalid_request_error",
+      },
+    });
+    return undefined;
+  }
   const body = await readJsonBody(req, maxBytes);
   if (!body.ok) {
     if (body.error === "payload too large") {
